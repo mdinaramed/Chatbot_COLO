@@ -30,6 +30,17 @@ app.use(express.json({ limit: "1mb" }));
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 const userSessions = {};
 const TELEGRAM_MESSAGE_LIMIT = 4000;
+const APPOINTMENT_PRICE = "5000 ₸";
+const APPOINTMENT_DAYS = [
+  { label: "Пн", value: "Mon" },
+  { label: "Вт", value: "Tue" },
+  { label: "Ср", value: "Wed" },
+  { label: "Чт", value: "Thu" },
+  { label: "Пт", value: "Fri" },
+];
+const MORNING_TIMES = ["09:00", "10:00", "11:00", "12:00", "13:00"];
+const EVENING_TIMES = ["15:00", "16:00", "17:00", "18:00"];
+const APPOINTMENT_TIMES = [...MORNING_TIMES, ...EVENING_TIMES];
 
 async function httpFetch(url, options) {
   if (typeof fetch === "function") {
@@ -212,8 +223,9 @@ Important:
 - Reply in Russian.
 - Do not add introductory phrases like "На основании предоставленных данных".
 - Start immediately with the analysis.
-- Keep the answer concise and structured.
-- Maximum length: 2500 characters.`;
+- Keep the answer very short, practical, and mobile-friendly.
+- Use simple words, no long medical explanations.
+- Maximum length: 700 characters.`;
 }
 
 function getQuestionBySession(session) {
@@ -272,6 +284,10 @@ function getUserFriendlyError(error) {
 
   if (message.includes("not found") || message.includes("404")) {
     return "Модель Gemini недоступна для этого API-ключа. Проверьте GEMINI_MODEL или используйте gemini-flash-latest.";
+  }
+
+  if (message.toLowerCase().includes("leaked")) {
+    return "Gemini API-ключ был помечен Google как скомпрометированный. Создайте новый ключ в Google AI Studio, замените GEMINI_API_KEY в .env и перезапустите бота.";
   }
 
   if (message.includes("API key") || message.includes("403") || message.includes("401")) {
@@ -358,7 +374,17 @@ function extractRiskLevel(text) {
   return labels[normalizedRisk] || riskMatch[1];
 }
 
-function textToBulletList(text, fallbackText) {
+function truncateText(text, maxLength = 72) {
+  const value = String(text || "").trim();
+
+  if (value.length <= maxLength) {
+    return value;
+  }
+
+  return `${value.slice(0, maxLength - 1).trim()}…`;
+}
+
+function textToBulletList(text, fallbackText, maxItems = 2) {
   const source = removeSectionHeading(text || fallbackText || "");
 
   if (!source) {
@@ -384,8 +410,10 @@ function textToBulletList(text, fallbackText) {
         .filter(Boolean);
 
   return items
-    .slice(0, 8)
-    .map((item) => `• ${escapeMarkdown(item)}`)
+    .map((item) => item.replace(/^[:\-\s]+/, "").trim())
+    .filter(Boolean)
+    .slice(0, maxItems)
+    .map((item) => `• ${escapeMarkdown(truncateText(item))}`)
     .join("\n");
 }
 
@@ -402,18 +430,20 @@ function formatAIResponse(text) {
     [/рекомендации/i, /recommendations/i],
     []
   );
+  const factorList = textToBulletList(riskFactors, cleanedText, 2);
+  const recommendationList = textToBulletList(
+    recommendations,
+    "Обратиться к врачу\nСледить за симптомами",
+    2
+  );
 
   return [
-    "🧠 *Результат анализа*",
-    "",
-    "📊 *Уровень риска:*",
-    escapeMarkdown(riskLevel),
-    "",
-    "⚠️ *Факторы риска:*",
-    textToBulletList(riskFactors, cleanedText),
-    "",
-    "💡 *Рекомендации:*",
-    textToBulletList(recommendations, "Обратиться к врачу для очной консультации."),
+    "🧠 *Результат*",
+    `📊 Риск: *${escapeMarkdown(riskLevel)}*`,
+    "⚠️ *Главное:*",
+    factorList,
+    "💡 *Что делать:*",
+    recommendationList,
   ].join("\n");
 }
 
@@ -454,9 +484,202 @@ function splitMessage(text, maxLength = TELEGRAM_MESSAGE_LIMIT) {
 async function sendLongMessage(chatId, text, options = {}) {
   const chunks = splitMessage(text);
 
-  for (const chunk of chunks) {
-    await bot.sendMessage(chatId, chunk, options);
+  for (let index = 0; index < chunks.length; index += 1) {
+    const isLastChunk = index === chunks.length - 1;
+    const messageOptions = isLastChunk
+      ? options
+      : {
+          ...options,
+          reply_markup: undefined,
+        };
+
+    await bot.sendMessage(chatId, chunks[index], messageOptions);
   }
+}
+
+function buildAppointmentStartKeyboard() {
+  return {
+    inline_keyboard: [
+      [{ text: "Записаться к врачу", callback_data: "appointment_start" }],
+    ],
+  };
+}
+
+function buildAppointmentDayKeyboard() {
+  return {
+    inline_keyboard: [
+      APPOINTMENT_DAYS.map((day) => ({
+        text: day.label,
+        callback_data: `day_${day.value}`,
+      })),
+    ],
+  };
+}
+
+function buildAppointmentTimeKeyboard() {
+  return {
+    inline_keyboard: [
+      MORNING_TIMES.map((time) => ({
+        text: time,
+        callback_data: `time_${time}`,
+      })),
+      [{ text: "Перерыв", callback_data: "noop" }],
+      EVENING_TIMES.map((time) => ({
+        text: time,
+        callback_data: `time_${time}`,
+      })),
+    ],
+  };
+}
+
+function buildAppointmentConfirmKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        { text: "Подтвердить", callback_data: "confirm_appointment" },
+        { text: "Отмена", callback_data: "cancel_appointment" },
+      ],
+    ],
+  };
+}
+
+async function showAppointmentDays(chatId) {
+  userSessions[chatId] = {
+    step: "day",
+    day: null,
+    time: null,
+    name: null,
+    phone: null,
+  };
+
+  await bot.sendMessage(chatId, "📅 Выберите день:", {
+    reply_markup: buildAppointmentDayKeyboard(),
+  });
+}
+
+async function showAppointmentTimes(chatId, day) {
+  userSessions[chatId] = {
+    step: "time",
+    day,
+    time: null,
+    name: null,
+    phone: null,
+  };
+
+  await bot.sendMessage(chatId, "⏰ Выберите время:", {
+    reply_markup: buildAppointmentTimeKeyboard(),
+  });
+}
+
+async function askAppointmentName(chatId, time) {
+  const session = userSessions[chatId];
+
+  if (!session?.day) {
+    await showAppointmentDays(chatId);
+    return;
+  }
+
+  userSessions[chatId] = {
+    ...session,
+    step: "name",
+    time,
+  };
+
+  await bot.sendMessage(chatId, "Введите ваше ФИО:");
+}
+
+async function showAppointmentConfirm(chatId) {
+  const session = userSessions[chatId];
+
+  if (!session?.day || !session?.time || !session?.name || !session?.phone) {
+    await showAppointmentDays(chatId);
+    return;
+  }
+
+  userSessions[chatId] = {
+    ...session,
+    step: "confirm",
+  };
+
+  await bot.sendMessage(
+    chatId,
+    [
+      "Проверьте запись:",
+      "",
+      `📅 ${escapeMarkdown(session.day)}`,
+      `⏰ ${escapeMarkdown(session.time)}`,
+      `👤 ${escapeMarkdown(session.name)}`,
+      `📞 ${escapeMarkdown(session.phone)}`,
+      "",
+      `Стоимость: *${escapeMarkdown(APPOINTMENT_PRICE)}*`,
+    ].join("\n"),
+    {
+      parse_mode: "Markdown",
+      reply_markup: buildAppointmentConfirmKeyboard(),
+    }
+  );
+}
+
+function getAppointmentDayLabel(value) {
+  return APPOINTMENT_DAYS.find((day) => day.value === value)?.label || null;
+}
+
+function isAppointmentSession(session) {
+  return ["day", "time", "name", "phone", "confirm"].includes(session?.step);
+}
+
+async function handleAppointmentMessage(chatId, text, session) {
+  const value = text.trim();
+
+  if (session.step === "name") {
+    if (value.length < 3) {
+      await bot.sendMessage(chatId, "Введите полное ФИО, пожалуйста.");
+      return;
+    }
+
+    userSessions[chatId] = {
+      ...session,
+      step: "phone",
+      name: value,
+    };
+
+    await bot.sendMessage(chatId, "Введите номер телефона:");
+    return;
+  }
+
+  if (session.step === "phone") {
+    if (value.replace(/\D/g, "").length < 10) {
+      await bot.sendMessage(chatId, "Введите корректный номер телефона.");
+      return;
+    }
+
+    userSessions[chatId] = {
+      ...session,
+      step: "confirm",
+      phone: value,
+    };
+
+    await showAppointmentConfirm(chatId);
+    return;
+  }
+
+  if (session.step === "day") {
+    await bot.sendMessage(chatId, "Выберите день кнопкой ниже:", {
+      reply_markup: buildAppointmentDayKeyboard(),
+    });
+    return;
+  }
+
+  if (session.step === "time") {
+    await bot.sendMessage(chatId, "Выберите время кнопкой ниже:", {
+      reply_markup: buildAppointmentTimeKeyboard(),
+    });
+    return;
+  }
+
+  await bot.sendMessage(chatId, "Подтвердите или отмените запись кнопкой ниже:", {
+    reply_markup: buildAppointmentConfirmKeyboard(),
+  });
 }
 
 async function completeQuestionnaire(chatId, session) {
@@ -496,7 +719,7 @@ async function completeQuestionnaire(chatId, session) {
 
     await sendLongMessage(chatId, formatAIResponse(json.result), {
       parse_mode: "Markdown",
-      reply_markup: { remove_keyboard: true },
+      reply_markup: buildAppointmentStartKeyboard(),
     });
   } catch (error) {
     console.log(`[BOT] Analysis error for chatId=${chatId}:`, error);
@@ -526,7 +749,7 @@ async function callGeminiModel(model, answers) {
       temperature: 0.2,
       topP: 0.9,
       topK: 40,
-      maxOutputTokens: 4096,
+      maxOutputTokens: 800,
     },
   };
 
@@ -656,6 +879,11 @@ bot.on("message", async (msg) => {
     return;
   }
 
+  if (isAppointmentSession(session)) {
+    await handleAppointmentMessage(chatId, text, session);
+    return;
+  }
+
   skipIrrelevantQuestions(session);
 
   const question = getQuestionBySession(session);
@@ -680,6 +908,98 @@ bot.on("message", async (msg) => {
   );
 
   await askCurrentQuestion(chatId, session);
+});
+
+bot.on("callback_query", async (query) => {
+  const chatId = query.message?.chat?.id;
+  const data = query.data || "";
+
+  if (!chatId) {
+    return;
+  }
+
+  try {
+    await bot.answerCallbackQuery(query.id);
+
+    if (data === "noop") {
+      return;
+    }
+
+    if (data === "appointment_start") {
+      console.log(`[APPOINTMENT] Start chatId=${chatId}`);
+      await showAppointmentDays(chatId);
+      return;
+    }
+
+    if (data.startsWith("day_")) {
+      const dayValue = data.slice("day_".length);
+      const dayLabel = getAppointmentDayLabel(dayValue);
+
+      if (!dayLabel) {
+        await bot.sendMessage(chatId, "Выберите день из списка.");
+        return;
+      }
+
+      console.log(`[APPOINTMENT] Day selected chatId=${chatId}, day=${dayLabel}`);
+      await showAppointmentTimes(chatId, dayLabel);
+      return;
+    }
+
+    if (data.startsWith("time_")) {
+      const time = data.slice("time_".length);
+
+      if (!APPOINTMENT_TIMES.includes(time)) {
+        await bot.sendMessage(chatId, "Выберите время из списка.");
+        return;
+      }
+
+      const session = userSessions[chatId];
+
+      if (!isAppointmentSession(session) || !session.day) {
+        await showAppointmentDays(chatId);
+        return;
+      }
+
+      console.log(`[APPOINTMENT] Time selected chatId=${chatId}, time=${time}`);
+      await askAppointmentName(chatId, time);
+      return;
+    }
+
+    if (data === "confirm_appointment") {
+      const appointment = userSessions[chatId];
+
+      if (
+        !isAppointmentSession(appointment) ||
+        !appointment.day ||
+        !appointment.time ||
+        !appointment.name ||
+        !appointment.phone
+      ) {
+        await showAppointmentDays(chatId);
+        return;
+      }
+
+      console.log(
+        `[APPOINTMENT] Confirmed chatId=${chatId}, day=${appointment.day}, time=${appointment.time}, name=${appointment.name}, phone=${appointment.phone}`
+      );
+
+      await bot.sendMessage(
+        chatId,
+        "Вы успешно записаны! С вами свяжется администратор."
+      );
+
+      delete userSessions[chatId];
+      return;
+    }
+
+    if (data === "cancel_appointment") {
+      delete userSessions[chatId];
+      await bot.sendMessage(chatId, "Запись отменена.");
+    }
+  } catch (error) {
+    console.log(`[APPOINTMENT] Callback error chatId=${chatId}:`, error);
+    await bot.sendMessage(chatId, "Не удалось оформить запись. Попробуйте ещё раз.");
+  }
 });
 
 bot.on("polling_error", (error) => {
