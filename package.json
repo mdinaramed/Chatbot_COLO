@@ -1,0 +1,23 @@
+{
+  "name": "telegram-anamnesis-gemini-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot that collects patient anamnesis data and sends it to Gemini for analysis.",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.6.1",
+    "express": "^4.22.1",
+    "node-fetch": "^3.3.2",
+    "node-telegram-bot-api": "^0.66.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
